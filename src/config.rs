@@ -1,4 +1,4 @@
-use crate::Backend;
+use crate::engine::Backend;
 use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
 use std::{env, fs, path::PathBuf};
@@ -10,6 +10,7 @@ pub struct Settings {
     pub model: Option<PathBuf>,
     pub backend: Backend,
     pub threads: usize,
+    pub gpu: Option<usize>,
     pub rate: usize,
     pub window: f32,
     pub overlap_ms: u32,
@@ -20,8 +21,9 @@ impl Default for Settings {
         Self {
             source: None,
             model: None,
-            backend: Backend::Vulkan,
-            threads: 4,
+            backend: Backend::Auto,
+            threads: std::thread::available_parallelism().map_or(1, |n| n.get().min(4)),
+            gpu: None,
             rate: 8000,
             window: 0.16,
             overlap_ms: 20,
@@ -31,6 +33,10 @@ impl Default for Settings {
 
 impl Settings {
     pub fn validate(&self) -> Result<()> {
+        ensure!(
+            self.gpu.is_none() || self.backend != Backend::Cpu,
+            "--gpu requires the auto or vulkan backend"
+        );
         if let Some(model) = &self.model {
             ensure!(model.is_absolute(), "model must be an absolute path");
         }

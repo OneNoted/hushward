@@ -1,17 +1,14 @@
-use anyhow::{Context, Result, bail, ensure};
-use clap::{Args, Parser, Subcommand, ValueEnum};
-use config::{Paths, Settings};
-use reuse_rs::{GpuDevice, Offline};
-use serde::{Deserialize, Serialize};
-use std::{
-    path::{Path, PathBuf},
-    process::ExitCode,
-    time::Instant,
-};
+use anyhow::{Context, Result, ensure};
+use clap::{Args, Parser, Subcommand};
+use config::Paths;
+use engine::Backend;
+use std::{path::PathBuf, process::ExitCode, time::Instant};
 
 mod assets;
 mod audio;
+mod bench;
 mod config;
+mod engine;
 mod live;
 mod setup;
 
@@ -28,16 +25,10 @@ struct Cli {
     backend: Option<Backend>,
     #[arg(long, global = true)]
     threads: Option<usize>,
+    #[arg(long, global = true, help = "Vulkan device index from `hushward gpus`")]
+    gpu: Option<usize>,
     #[command(subcommand)]
     command: Command,
-}
-
-#[derive(Clone, Copy, Debug, Default, ValueEnum, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-enum Backend {
-    Cpu,
-    #[default]
-    Vulkan,
 }
 
 #[derive(Args, Default)]
@@ -90,19 +81,14 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// List Vulkan devices and their indices.
+    Gpus,
     /// Run in the foreground; Ctrl-C dismisses the ward.
     Live(LiveArgs),
     /// Check whether the saved live preset keeps up on this computer.
     Check,
     /// Measure inference speed with synthetic audio.
-    Bench {
-        #[arg(long, default_value_t = 0.16)]
-        seconds: f32,
-        #[arg(long, default_value_t = 5)]
-        runs: usize,
-        #[arg(long, default_value_t = 8000)]
-        rate: u32,
-    },
+    Bench(bench::Args),
     /// Clean a WAV recording without changing the original.
     Clean {
         input: PathBuf,
@@ -112,37 +98,13 @@ enum Command {
     },
 }
 
-fn load(path: &Path, backend: Backend) -> Result<Offline> {
-    ensure!(
-        path.is_file(),
-        "Model not found at {}. Run `hushward setup` or `hushward fetch`.",
-        path.display()
-    );
-    assets::verify(path)?;
-    eprintln!("Loading RE-USE on {backend:?}…");
-    let model = match backend {
-        Backend::Cpu => Offline::load(path),
-        Backend::Vulkan => Offline::load_gpu(path, GpuDevice::Vulkan),
-    };
-    model.map_err(|e| anyhow::anyhow!("Cannot load the {backend:?} model: {e:#}"))
-}
-
-#[derive(Serialize)]
-struct Measurement {
-    backend: Backend,
-    threads: usize,
-    sample_rate: u32,
-    audio_seconds: f64,
-    inference_seconds: f64,
-    realtime_factor: f64,
-}
-
 fn run() -> Result<()> {
     let cli = Cli::parse();
     let paths = Paths::discover()?;
     match &cli.command {
         Command::Doctor => return setup::doctor(&paths),
         Command::Devices { json } => return audio::devices(*json),
+        Command::Gpus => return engine::list_gpus(),
         Command::Start => return setup::control("start", &paths),
         Command::Stop => return setup::control("stop", &paths),
         Command::Status => return setup::status(&paths),
@@ -155,6 +117,9 @@ fn run() -> Result<()> {
     }
     if let Some(threads) = cli.threads {
         settings.threads = threads;
+    }
+    if let Some(gpu) = cli.gpu {
+        settings.gpu = Some(gpu);
     }
     if let Some(model) = cli.model {
         settings.model = Some(std::path::absolute(model)?);
@@ -178,45 +143,7 @@ fn run() -> Result<()> {
     match cli.command {
         Command::Setup { source, yes } => return setup::run(&paths, settings, source, yes),
         Command::Fetch => return assets::fetch(model_path),
-        Command::Bench {
-            seconds,
-            runs,
-            rate,
-        } => {
-            ensure!(
-                seconds.is_finite()
-                    && (0.1..=30.0).contains(&seconds)
-                    && (1..=1000).contains(&runs)
-                    && reuse_rs::audio::SAMPLE_RATES.contains(&rate),
-                "Use 0.1–30 seconds, 1–1000 runs, and a supported sample rate."
-            );
-            let model = initialize(model_path, &settings)?;
-            let samples: Vec<f32> = (0..(seconds * rate as f32) as usize)
-                .map(|i| {
-                    let t = i as f32 / rate as f32;
-                    0.05 * (std::f32::consts::TAU * 180.0 * t).sin()
-                        + 0.01 * (std::f32::consts::TAU * 1739.0 * t).sin()
-                })
-                .collect();
-            eprintln!("Warming up…");
-            enhance(&model, &samples, rate)?;
-            for _ in 0..runs {
-                let start = Instant::now();
-                enhance(&model, &samples, rate)?;
-                let elapsed = start.elapsed().as_secs_f64();
-                println!(
-                    "{}",
-                    serde_json::to_string(&Measurement {
-                        backend: settings.backend,
-                        threads: settings.threads,
-                        sample_rate: rate,
-                        audio_seconds: seconds as f64,
-                        inference_seconds: elapsed,
-                        realtime_factor: elapsed / seconds as f64
-                    })?
-                );
-            }
-        }
+        Command::Bench(args) => bench::run(args, model_path, &settings)?,
         Command::Clean {
             input,
             output,
@@ -236,16 +163,16 @@ fn run() -> Result<()> {
                     .to_str()
                     .context("The input path is not valid UTF-8")?,
             )
-            .map_err(|e| anyhow::anyhow!("Read audio: {e:#}"))?;
+            .context("Read audio")?;
             ensure!(
                 !samples.is_empty() && samples.iter().all(|s| s.is_finite()),
                 "Input audio is empty or contains invalid samples."
             );
-            let model = initialize(model_path, &settings)?;
+            let (model, _) = engine::load(model_path, &settings)?;
             let start = Instant::now();
             let output_samples = model
                 .enhance_chunked(&samples, rate, chunk_seconds, 0.5)
-                .map_err(|e| anyhow::anyhow!("Enhance audio: {e:#}"))?;
+                .context("Enhance audio")?;
             assets::write_wav(&output, &output_samples, rate)?;
             println!(
                 "Cleaned {:.1}s of audio in {:.1}s → {}",
@@ -256,7 +183,7 @@ fn run() -> Result<()> {
         }
         Command::Live(args) => {
             let source = audio::resolve_source(settings.source.as_deref())?;
-            let model = initialize(model_path, &settings)?;
+            let (model, _) = engine::load(model_path, &settings)?;
             live::run(
                 &model,
                 &source,
@@ -267,7 +194,7 @@ fn run() -> Result<()> {
             )?;
         }
         Command::Check => {
-            let model = initialize(model_path, &settings)?;
+            let (model, _) = engine::load(model_path, &settings)?;
             let elapsed = live::preflight(&model, &settings)?;
             println!(
                 "Ready for live speech: {:.0} ms inference, {:.0} ms available per window.",
@@ -278,23 +205,6 @@ fn run() -> Result<()> {
         _ => unreachable!(),
     }
     Ok(())
-}
-
-fn initialize(path: &Path, settings: &Settings) -> Result<Offline> {
-    rayon::ThreadPoolBuilder::new()
-        .num_threads(settings.threads)
-        .build_global()?;
-    load(path, settings.backend)
-}
-
-fn enhance(model: &Offline, samples: &[f32], rate: u32) -> Result<Vec<f32>> {
-    let output = model
-        .enhance(samples, rate)
-        .map_err(|e| anyhow::anyhow!("Inference: {e:#}"))?;
-    if output.len() != samples.len() || !output.iter().all(|v| v.is_finite()) {
-        bail!("The model returned invalid audio.");
-    }
-    Ok(output)
 }
 
 fn main() -> ExitCode {

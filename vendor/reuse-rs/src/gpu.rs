@@ -3,54 +3,42 @@
 //! and output gate, where one thread per (sequence, channel) walks the whole sequence.
 
 use crate::weights::Weights;
+use anyhow::Result;
 use burn::backend::{backend_extension, tensor::FloatTensor, Backend, Dispatch};
 use burn::tensor::{Device, DeviceKind, Tensor, TensorData};
 use burn_cubecl::{
     kernel::into_contiguous, ops::numeric::empty_device_dtype, tensor::CubeTensor, CubeBackend,
 };
 use cubecl::{calculate_cube_count_elemwise, prelude::CubeDim};
-use eyre::Result;
 use kernel::{conv_kernel, finish_kernel, scan_kernel};
 
-/// Which GPU API to run on. Each one needs its cargo feature (`wgpu`, `metal`, `vulkan`, `cuda`,
-/// `rocm`).
+/// Vulkan runs on AMD, Intel and NVIDIA drivers without a vendor-specific runtime.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum GpuDevice {
-    /// wgpu on whatever the system offers: Metal, Vulkan or DX12.
-    Wgpu,
-    /// Metal with native MSL shaders (Apple).
-    Metal,
-    /// Vulkan with SPIR-V shaders.
     Vulkan,
-    /// CUDA device with this index (NVIDIA).
-    Cuda(usize),
-    /// ROCm device with this index (AMD).
-    Rocm(usize),
+    VulkanIndex(usize),
+}
+
+pub fn vulkan_devices() -> Vec<String> {
+    Device::enumerate(burn::tensor::DeviceType::Vulkan)
+        .iter()
+        .map(|device| {
+            device
+                .identity()
+                .map_or_else(|| format!("{device:?}"), |id| id.name)
+        })
+        .collect()
 }
 
 impl GpuDevice {
     fn device(self) -> Result<Device> {
-        let missing =
-            |feature: &str| eyre::eyre!("reuse-rs was built without the `{feature}` feature");
+        let devices = Device::enumerate(burn::tensor::DeviceType::Vulkan);
+        anyhow::ensure!(!devices.is_empty(), "no Vulkan devices found");
         match self {
-            #[cfg(feature = "wgpu")]
-            Self::Wgpu => Ok(Device::wgpu(DeviceKind::DefaultDevice)),
-            #[cfg(feature = "metal")]
-            Self::Metal => Ok(Device::metal(DeviceKind::DefaultDevice)),
-            #[cfg(feature = "vulkan")]
             Self::Vulkan => Ok(Device::vulkan(DeviceKind::DefaultDevice)),
-            #[cfg(feature = "cuda")]
-            Self::Cuda(i) => Ok(Device::cuda(i)),
-            #[cfg(feature = "rocm")]
-            Self::Rocm(i) => Ok(Device::rocm(i)),
-            #[allow(unreachable_patterns)]
-            other => Err(missing(match other {
-                Self::Wgpu => "wgpu",
-                Self::Metal => "metal",
-                Self::Vulkan => "vulkan",
-                Self::Cuda(_) => "cuda",
-                Self::Rocm(_) => "rocm",
-            })),
+            Self::VulkanIndex(index) => devices.get(index).cloned().ok_or_else(|| {
+                anyhow::anyhow!("Vulkan device {index} is unavailable; run `hushward gpus`")
+            }),
         }
     }
 }
@@ -385,7 +373,7 @@ fn tensor<const D: usize>(w: &Weights, name: &str, device: &Device) -> Result<Te
     let shape: [usize; D] = w
         .shape(name)?
         .try_into()
-        .map_err(|_| eyre::eyre!("{name}: expected {D} dimensions"))?;
+        .map_err(|_| anyhow::anyhow!("{name}: expected {D} dimensions"))?;
     Ok(Tensor::from_data(
         TensorData::new(w.get(name)?, shape),
         device,

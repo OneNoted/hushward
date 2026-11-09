@@ -1,4 +1,4 @@
-use eyre::{eyre, Result};
+use anyhow::{anyhow, Result};
 use std::collections::HashMap;
 use std::path::Path;
 
@@ -10,10 +10,10 @@ pub struct Weights {
 impl Weights {
     pub fn load(path: impl AsRef<Path>) -> Result<Self> {
         let bytes = std::fs::read(path.as_ref())?;
-        let file = safetensors::SafeTensors::deserialize(&bytes).map_err(|e| eyre!("{e}"))?;
+        let file = safetensors::SafeTensors::deserialize(&bytes).map_err(|e| anyhow!("{e}"))?;
         let mut tensors = HashMap::new();
         for (name, view) in file.tensors() {
-            eyre::ensure!(
+            anyhow::ensure!(
                 view.dtype() == safetensors::Dtype::F32,
                 "{name}: expected f32, got {:?}",
                 view.dtype()
@@ -41,6 +41,6 @@ impl Weights {
     fn entry(&self, name: &str) -> Result<&(Vec<usize>, Vec<f32>)> {
         self.tensors
             .get(name)
-            .ok_or_else(|| eyre!("missing weight {name}"))
+            .ok_or_else(|| anyhow!("missing weight {name}"))
     }
 }

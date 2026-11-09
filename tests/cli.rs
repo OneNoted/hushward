@@ -58,3 +58,25 @@ fn fetch_rejects_corrupt_weights_without_overwriting_them() {
     assert_eq!(fs::read(model).unwrap(), b"damaged weights");
     assert!(String::from_utf8_lossy(&result.stderr).contains("checksum mismatch"));
 }
+
+#[test]
+fn invalid_benchmark_fails_before_loading_a_model() {
+    let dir = tempfile::tempdir().unwrap();
+    let result = command(dir.path())
+        .args(["bench", "--warmup", "0"])
+        .output()
+        .unwrap();
+    assert!(!result.status.success());
+    assert!(String::from_utf8_lossy(&result.stderr).contains("1–100 warmup"));
+}
+
+#[test]
+fn cpu_rejects_a_gpu_selection() {
+    let dir = tempfile::tempdir().unwrap();
+    let result = command(dir.path())
+        .args(["--backend", "cpu", "--gpu", "0", "bench"])
+        .output()
+        .unwrap();
+    assert!(!result.status.success());
+    assert!(String::from_utf8_lossy(&result.stderr).contains("--gpu requires"));
+}

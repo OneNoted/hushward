@@ -7,8 +7,12 @@ permissions:
 jobs:
   check:
     runs-on: ubuntu-24.04
+    strategy:
+      matrix:
+        task: [ci, "ci:cpu"]
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
       - uses: jdx/mise-action@b44d12e7d0d8ee7461bb893e1b1993500433185b # v5
-      - run: sudo apt-get update && sudo apt-get install -y pkg-config libwayland-dev libudev-dev libxkbcommon-dev
-      - run: mise run ci
+      - if: matrix.task == 'ci'
+        run: sudo apt-get update && sudo apt-get install -y pkg-config libwayland-dev libudev-dev libxkbcommon-dev
+      - run: mise run ${{ matrix.task }}

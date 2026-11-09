@@ -4,14 +4,14 @@
 //! Conv activations are channel-major `[channels][time][freq]`; Mamba activations are
 //! `[sequences][positions][channels]`.
 
-use crate::audio::{hann_window, istft, stft, SAMPLE_RATES};
+use crate::audio::{hann_window, Stft, SAMPLE_RATES};
 use crate::layers::BiMambaBlock;
 use crate::ops::{gemm, transpose};
 use crate::weights::Weights;
-use eyre::Result;
+use anyhow::Result;
 use rayon::prelude::*;
-use std::path::Path;
-#[cfg(feature = "gpu")]
+use std::{path::Path, sync::OnceLock};
+#[cfg(feature = "vulkan")]
 #[path = "offline_gpu.rs"]
 mod accelerated;
 
@@ -319,15 +319,16 @@ struct Block {
 
 /// Offline RE-USE: the whole recording goes through the model at once.
 pub struct Offline {
+    stft: [OnceLock<Stft>; SAMPLE_RATES.len()],
     encoder_in: ConvBlock,
     encoder_dense: DenseBlock,
     encoder_out: ConvBlock,
     blocks: Vec<Block>,
     mag: Decoder,
     pha: Decoder,
-    #[cfg(feature = "gpu")]
+    #[cfg(feature = "vulkan")]
     gpu: Option<crate::gpu::Model>,
-    #[cfg(feature = "gpu")]
+    #[cfg(feature = "vulkan")]
     accelerated: Option<accelerated::Full>,
 }
 
@@ -349,9 +350,10 @@ impl Offline {
                 freq: BiMambaBlock::load(&w, &format!("TSMamba.{i}.freq_mamba"))?,
             });
         }
-        eyre::ensure!(!blocks.is_empty(), "no TSMamba blocks in the model");
+        anyhow::ensure!(!blocks.is_empty(), "no TSMamba blocks in the model");
         let enc = "dense_encoder";
         Ok(Self {
+            stft: std::array::from_fn(|_| OnceLock::new()),
             encoder_in: ConvBlock::load(
                 &w,
                 &format!("{enc}.dense_conv_1"),
@@ -366,16 +368,15 @@ impl Offline {
             blocks,
             mag: Decoder::load(&w, "mask_decoder", &["final_conv"])?,
             pha: Decoder::load(&w, "phase_decoder", &["phase_conv_r", "phase_conv_i"])?,
-            #[cfg(feature = "gpu")]
+            #[cfg(feature = "vulkan")]
             gpu: None,
-            #[cfg(feature = "gpu")]
+            #[cfg(feature = "vulkan")]
             accelerated: None,
         })
     }
 
-    /// Like [`load`](Self::load), with the TF-Mamba blocks on a GPU. The convolutional encoder
-    /// and decoders stay on the CPU, where they run faster.
-    #[cfg(feature = "gpu")]
+    /// Load the full model on a Vulkan device.
+    #[cfg(feature = "vulkan")]
     pub fn load_gpu(path: impl AsRef<Path>, device: crate::GpuDevice) -> Result<Self> {
         let mut model = Self::load(path.as_ref())?;
         let w = Weights::load(path)?;
@@ -399,7 +400,7 @@ impl Offline {
 
     /// The TF-Mamba blocks on `[freq][time][channels]` rows.
     fn mamba(&self, mut rows: Vec<f32>, time: usize, freq: usize, channels: usize) -> Vec<f32> {
-        #[cfg(feature = "gpu")]
+        #[cfg(feature = "vulkan")]
         if let Some(gpu) = &self.gpu {
             return gpu.mamba(&rows, time, freq, channels);
         }
@@ -417,7 +418,7 @@ impl Offline {
     /// Model on a compressed magnitude and phase spectrogram (`[freq][time]` each); returns the
     /// enhanced magnitude (before decompression) and phase in the same shape.
     pub fn forward(&self, mag: &[Vec<f32>], pha: &[Vec<f32>]) -> (Vec<Vec<f32>>, Vec<Vec<f32>>) {
-        #[cfg(feature = "gpu")]
+        #[cfg(feature = "vulkan")]
         if let Some(full) = &self.accelerated {
             return full.forward(mag, pha, self.gpu.as_ref().unwrap());
         }
@@ -478,7 +479,7 @@ impl Offline {
     /// Memory grows with the length; for long recordings use
     /// [`enhance_chunked`](Self::enhance_chunked).
     pub fn enhance(&self, samples: &[f32], sample_rate: u32) -> Result<Vec<f32>> {
-        eyre::ensure!(
+        anyhow::ensure!(
             SAMPLE_RATES.contains(&sample_rate),
             "unsupported sample rate {sample_rate} Hz, expected one of {SAMPLE_RATES:?}"
         );
@@ -486,7 +487,12 @@ impl Offline {
             return Ok(Vec::new());
         }
         let (n_fft, hop) = Self::stft_sizes(sample_rate);
-        let (mut mag, pha) = stft(samples, n_fft, hop, n_fft)?;
+        let index = SAMPLE_RATES
+            .iter()
+            .position(|&rate| rate == sample_rate)
+            .unwrap();
+        let plan = self.stft[index].get_or_init(|| Stft::new(n_fft, n_fft));
+        let (mut mag, pha) = plan.stft(samples, hop)?;
         mag.iter_mut().flatten().for_each(|m| *m = m.ln_1p());
         let (mut mag, pha) = self.forward(&mag, &pha);
         // Frames where most bins come out as zero are cleared, as NVIDIA's inference does.
@@ -499,7 +505,7 @@ impl Offline {
                 *m = if clear { 0.0 } else { m.max(0.0).exp_m1() };
             }
         }
-        let mut out = istft(&mag, &pha, n_fft, hop, n_fft)?;
+        let mut out = plan.istft(&mag, &pha, hop)?;
         out.resize(samples.len(), 1e-8);
         Ok(out)
     }
@@ -517,7 +523,7 @@ impl Offline {
     ) -> Result<Vec<f32>> {
         let chunk = (chunk_seconds as f64 * sample_rate as f64) as usize;
         let hop = (hop_fraction as f64 * chunk as f64) as usize;
-        eyre::ensure!(
+        anyhow::ensure!(
             chunk > 0 && hop > 0,
             "chunk and hop must be at least one sample"
         );

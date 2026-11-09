@@ -175,7 +175,7 @@ impl Full {
                 }
             }
         }
-        let x = tensor(&data, [1, 2, time, freq], &self.device);
+        let x = Tensor::<4>::from_data(TensorData::new(data, [1, 2, time, freq]), &self.device);
         let x = self
             .encoder_out
             .run(self.encoder_dense.run(self.encoder_in.run(x)));
@@ -190,16 +190,15 @@ impl Full {
         let imaginary = phase.pop().unwrap();
         let real = phase.pop().unwrap();
         let phase = imaginary.atan2(real);
-        let extract = |x: T<4>| {
-            let values = x
-                .slice([0..1, 0..1, 0..frames, 0..bins])
-                .reshape([frames, bins])
-                .transpose()
-                .into_data()
-                .try_into_vec::<f32>()
-                .expect("FP32 model output");
-            values.chunks(frames).map(|r| r.to_vec()).collect()
-        };
-        (extract(magnitude), extract(phase))
+        let values = Tensor::cat(vec![magnitude, phase], 1)
+            .slice([0..1, 0..2, 0..frames, 0..bins])
+            .permute([0, 1, 3, 2])
+            .reshape([2 * bins, frames])
+            .into_data()
+            .try_into_vec::<f32>()
+            .expect("FP32 model output");
+        let mut rows = values.chunks_exact(frames).map(<[f32]>::to_vec);
+        let magnitude = rows.by_ref().take(bins).collect();
+        (magnitude, rows.collect())
     }
 }

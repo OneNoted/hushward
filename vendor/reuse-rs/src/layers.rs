@@ -1,9 +1,9 @@
 //! RE-USE building blocks. Conv activations are channel-major `[channels][freq]`;
 //! Mamba activations are position-major `[positions][channels]`.
 
-use crate::ops::{fast_exp, fast_exp_fma, gemm, layer_norm_rows, silu, softplus, softplus_fma};
+use crate::ops::{fast_exp, fast_exp_fma, gemm, layer_norm_rows, silu, softplus_in_place};
 use crate::weights::Weights;
-use eyre::Result;
+use anyhow::Result;
 use rayon::prelude::*;
 
 /// Linear layer `y = x·Wᵀ + b` on position-major rows.
@@ -123,7 +123,7 @@ impl Mamba {
         let conv_taps = (0..dc * di)
             .map(|i| conv_w[(i % di) * dc + i / di])
             .collect();
-        eyre::ensure!(
+        anyhow::ensure!(
             a_shape[1] == STATE,
             "{prefix}: d_state {} is not {STATE}",
             a_shape[1]
@@ -152,11 +152,8 @@ impl Mamba {
     fn ssm_inputs<const FAST: bool>(&self, xc: &[f32], rows: usize) -> (Vec<f32>, Vec<f32>) {
         let dbl = self.x_proj.forward(xc, rows);
         let mut dt = self.dt_proj.forward_strided(&dbl, rows, self.x_proj.out);
-        dt.par_chunks_mut(4096).for_each(|c| {
-            for v in c {
-                *v = if FAST { softplus_fma(*v) } else { softplus(*v) };
-            }
-        });
+        dt.par_chunks_mut(4096)
+            .for_each(|c| softplus_in_place(c, FAST));
         (dt, dbl)
     }
 
@@ -186,6 +183,61 @@ impl Mamba {
         c0: usize,
         y: &mut [f32],
     ) {
+        #[cfg(target_arch = "x86_64")]
+        if std::is_x86_feature_detected!("avx2") && std::is_x86_feature_detected!("fma") {
+            // Feature detection makes the specialized kernels safe on portable builds.
+            unsafe {
+                if std::is_x86_feature_detected!("avx512f")
+                    && std::is_x86_feature_detected!("avx512vl")
+                {
+                    self.scan_channels_avx512(dt, dbl, xc, start, c0, y);
+                } else {
+                    self.scan_channels_avx(dt, dbl, xc, start, c0, y);
+                }
+            }
+            return;
+        }
+        self.scan_channels_inner::<{ cfg!(target_arch = "aarch64") }>(dt, dbl, xc, start, c0, y);
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "avx2,fma")]
+    unsafe fn scan_channels_avx(
+        &self,
+        dt: &[f32],
+        dbl: &[f32],
+        xc: &[f32],
+        start: usize,
+        c0: usize,
+        y: &mut [f32],
+    ) {
+        self.scan_channels_inner::<true>(dt, dbl, xc, start, c0, y);
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "avx2,fma,avx512f,avx512vl")]
+    unsafe fn scan_channels_avx512(
+        &self,
+        dt: &[f32],
+        dbl: &[f32],
+        xc: &[f32],
+        start: usize,
+        c0: usize,
+        y: &mut [f32],
+    ) {
+        self.scan_channels_inner::<true>(dt, dbl, xc, start, c0, y);
+    }
+
+    #[inline(always)]
+    fn scan_channels_inner<const FMA: bool>(
+        &self,
+        dt: &[f32],
+        dbl: &[f32],
+        xc: &[f32],
+        start: usize,
+        c0: usize,
+        y: &mut [f32],
+    ) {
         const W: usize = 32;
         let (di, nd) = (self.d_inner, self.x_proj.out);
         let lanes = |v: &[f32], at: usize| -> [f32; W] { v[at..][..W].try_into().unwrap() };
@@ -201,9 +253,15 @@ impl Mamba {
             let mut acc = [0f32; W];
             for n in 0..STATE {
                 for j in 0..W {
-                    let decay = fast_exp_fma(delta[j] * a[n][j]);
-                    s[n][j] = decay.mul_add(s[n][j], dx[j] * b[n]);
-                    acc[j] = s[n][j].mul_add(cm[n], acc[j]);
+                    if FMA {
+                        let decay = fast_exp_fma(delta[j] * a[n][j]);
+                        s[n][j] = decay.mul_add(s[n][j], dx[j] * b[n]);
+                        acc[j] = s[n][j].mul_add(cm[n], acc[j]);
+                    } else {
+                        let decay = fast_exp(delta[j] * a[n][j]);
+                        s[n][j] = decay * s[n][j] + dx[j] * b[n];
+                        acc[j] += s[n][j] * cm[n];
+                    }
                 }
             }
             out[c0..][..W].copy_from_slice(&acc);

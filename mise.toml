@@ -1,6 +1,3 @@
-[env]
-RUSTFLAGS = "-C target-cpu=native"
-
 [tools]
 rust = { version = "nightly-2026-11-09", components = "clippy,rustfmt" }
 actionlint = "1.7.12"
@@ -10,8 +7,24 @@ description = "Show Hushward commands"
 run = "mise tasks"
 
 [tasks.build]
-description = "Build the release binary"
+description = "Build the release binary for this computer"
+env.RUSTFLAGS = "-C target-cpu=native"
 run = "cargo build --release --locked"
+
+[tasks."build:portable"]
+description = "Build without machine-specific CPU instructions"
+env.RUSTFLAGS = ""
+run = "cargo build --release --locked"
+
+[tasks."build:cpu"]
+description = "Build without Vulkan or GPU dependencies"
+env.RUSTFLAGS = "-C target-cpu=native"
+run = "cargo build --release --locked --no-default-features"
+
+[tasks.bench]
+description = "Measure warm inference speed"
+depends = ["build"]
+run = "./target/release/hushward bench"
 
 [tasks.fmt]
 description = "Format Rust and mise configuration"
@@ -34,10 +47,22 @@ run = "cargo test --release --locked --workspace"
 description = "Run all checks"
 run = ["mise run lint", "mise run test"]
 
+[tasks."ci:cpu"]
+description = "Check and test the build without GPU dependencies"
+run = [
+  "cargo clippy --release --locked --workspace --all-targets --no-default-features -- -D warnings",
+  "cargo test --release --locked --workspace --no-default-features",
+]
+
 [tasks.setup]
 description = "Choose a microphone, fetch the model and install Hushward"
 depends = ["build"]
 run = "./target/release/hushward setup"
+
+[tasks."setup:cpu"]
+description = "Install Hushward without building GPU support"
+depends = ["build:cpu"]
+run = "./target/release/hushward --backend cpu setup"
 
 [tasks.run]
 description = "Run a command from this checkout"

@@ -1,3 +1,5 @@
+#![cfg(feature = "vulkan")]
+
 use reuse_rs::{GpuDevice, Offline};
 use std::{env, path::PathBuf};
 

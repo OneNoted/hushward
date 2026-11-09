@@ -1,6 +1,7 @@
 use crate::{
     audio::{self, VIRTUAL_SOURCE as NAME, move_readers, pactl},
     config::Settings,
+    engine::enhance,
 };
 use anyhow::{Context, Result, bail, ensure};
 use reuse_rs::Offline;
@@ -73,13 +74,11 @@ pub fn preflight(model: &Offline, settings: &Settings) -> Result<f64> {
     settings.validate()?;
     let samples = vec![0.0; (settings.window as f64 * settings.rate as f64).round() as usize];
     eprintln!("Checking the live preset…");
-    model
-        .enhance(&samples, settings.rate as u32)
-        .map_err(|e| anyhow::anyhow!("Warmup: {e:#}"))?;
+    for _ in 0..3 {
+        enhance(model, &samples, settings.rate as u32).context("Warmup")?;
+    }
     let start = Instant::now();
-    model
-        .enhance(&samples, settings.rate as u32)
-        .map_err(|e| anyhow::anyhow!("Preflight: {e:#}"))?;
+    enhance(model, &samples, settings.rate as u32).context("Preflight")?;
     let elapsed = start.elapsed().as_secs_f64();
     let budget = settings.window as f64 - settings.overlap_ms as f64 / 1000.0;
     ensure!(
@@ -218,14 +217,8 @@ pub fn run(
             "Microphone produced invalid samples"
         );
         let start = Instant::now();
-        let mut clean = model
-            .enhance(&samples, rate as u32)
-            .map_err(|e| anyhow::anyhow!("Denoise: {e:#}"))?;
+        let mut clean = enhance(model, &samples, rate as u32).context("Denoise")?;
         let seconds = start.elapsed().as_secs_f64();
-        ensure!(
-            clean.len() == samples.len() && clean.iter().all(|v| v.is_finite()),
-            "Invalid model output; stopping the ward"
-        );
         if !tail.is_empty() {
             blend(&tail, &mut clean[..overlap]);
         }

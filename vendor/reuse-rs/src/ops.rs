@@ -233,6 +233,45 @@ pub fn softplus_fma(x: f32) -> f32 {
     }
 }
 
+pub fn softplus_in_place(values: &mut [f32], fast: bool) {
+    #[cfg(target_arch = "x86_64")]
+    if fast && std::is_x86_feature_detected!("avx2") && std::is_x86_feature_detected!("fma") {
+        // Check the required instruction sets before entering either kernel.
+        unsafe {
+            if std::is_x86_feature_detected!("avx512f") && std::is_x86_feature_detected!("avx512vl")
+            {
+                softplus_avx512(values);
+            } else {
+                softplus_avx(values);
+            }
+        }
+        return;
+    }
+    for value in values {
+        *value = if fast && cfg!(target_arch = "aarch64") {
+            softplus_fma(*value)
+        } else {
+            softplus(*value)
+        };
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn softplus_avx(values: &mut [f32]) {
+    for value in values {
+        *value = softplus_fma(*value);
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma,avx512f,avx512vl")]
+unsafe fn softplus_avx512(values: &mut [f32]) {
+    for value in values {
+        *value = softplus_fma(*value);
+    }
+}
+
 #[inline(always)]
 pub fn silu(x: f32) -> f32 {
     x / (1.0 + fast_exp(-x))

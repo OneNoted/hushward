@@ -1,11 +1,11 @@
 # Hushward
 
 Microphone noise suppression for Linux using [NVIDIA NemotronLabs RE-USE](https://huggingface.co/nvidia/NVIDIA-NemotronLabs-RE-USE).
-Written in Rust, with PipeWire for audio and Vulkan for inference. Audio stays on your machine.
+Written in Rust, with PipeWire for audio and CPU or Vulkan inference. Audio stays on your machine.
 
 ## Install
 
-Requires Linux, PipeWire, Vulkan and [mise](https://mise.jdx.dev/getting-started.html),
+Requires Linux, PipeWire and [mise](https://mise.jdx.dev/getting-started.html),
 plus `pw-cat`, `pactl`, `curl` and systemd user services.
 
 ```sh
@@ -18,6 +18,8 @@ mise run start
 ```
 
 Setup asks which microphone to use and downloads the model (39 MB).
+Vulkan supports AMD, Intel and NVIDIA GPUs with a working Vulkan driver;
+Hushward falls back to CPU when Vulkan is unavailable.
 Select **Hushward** in your call app if it doesn't follow the system default.
 
 ## Use
@@ -51,7 +53,15 @@ The full FP32 model is used; short live windows give it less context than record
 ## Development
 
 `mise run ci` runs all checks. `mise tasks` lists the other commands.
-Builds target the local CPU, so build on the machine that will run Hushward.
+Normal builds tune for the local CPU. Use `mise run build:portable` for a binary
+you can share with other CPUs; it detects AVX2/AVX-512 and FMA at runtime.
+`mise run build:cpu` skips GPU dependencies, and `mise run setup:cpu` installs it.
+For a portable CPU-only build: `mise run build:portable -- --no-default-features`.
+
+Use `mise run bench` for timing, `mise run run -- gpus` to list GPUs, or
+`mise run run -- --gpu 0 check` to select one. Set `backend = "cpu"` or
+`gpu = 0` in the settings file to keep that choice. CPU inference is useful for
+recordings; live mode still needs to pass the timing check.
 
 ## Licences
 

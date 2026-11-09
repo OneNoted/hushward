@@ -10,13 +10,14 @@ keywords = ["speech-enhancement", "denoising", "mamba", "real-time", "audio"]
 categories = ["multimedia::audio", "science"]
 
 [dependencies]
-eyre = "0.6"
+anyhow = "1"
 hound = "3.5"
 rayon = "1.12.0"
 realfft = "3"
 safetensors = ">=0.7, <0.9"
 
 [dependencies.burn]
+package = "burn-core"
 version = "0.22.1"
 default-features = false
 features = ["std", "extension"]
@@ -35,14 +36,7 @@ features = ["std"]
 optional = true
 
 [features]
-# The offline model on a GPU with Burn. Enable one or more backends:
-gpu = ["dep:burn", "dep:burn-cubecl", "dep:cubecl"]
-# wgpu on whatever the system offers (Metal, Vulkan, DX12). Use this only if your hw very old and doesn't work with vulkan. For apple, use directly metal.
-wgpu = ["gpu", "burn/wgpu"]
-metal = ["gpu", "burn/metal"]
-vulkan = ["gpu", "burn/vulkan"]
-cuda = ["gpu", "burn/cuda"]
-rocm = ["gpu", "burn/rocm"]
+vulkan = ["dep:burn", "dep:burn-cubecl", "dep:cubecl", "burn/vulkan"]
 
 [target.'cfg(not(target_os = "macos"))'.dependencies]
 matrixmultiply = "0.3"

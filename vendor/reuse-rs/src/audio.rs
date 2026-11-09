@@ -1,22 +1,10 @@
-use eyre::{eyre, Result};
-use realfft::RealFftPlanner;
+use anyhow::{anyhow, Result};
+use realfft::{ComplexToReal, RealFftPlanner, RealToComplex};
 use std::f32::consts::PI;
+use std::sync::Arc;
 
 /// Sample rates the model was trained on.
 pub const SAMPLE_RATES: [u32; 7] = [8000, 16000, 22050, 24000, 32000, 44100, 48000];
-
-/// `(n_fft, hop)` for `sample_rate`: a 40 ms window and a 20 ms hop, scaled from 320/160 at 8 kHz
-/// and rounded up to even sizes, as NVIDIA's inference does.
-pub fn stft_sizes(sample_rate: u32) -> Result<(usize, usize)> {
-    if !SAMPLE_RATES.contains(&sample_rate) {
-        return Err(eyre!(
-            "unsupported sample rate {sample_rate} Hz, expected one of {SAMPLE_RATES:?}"
-        ));
-    }
-    let even = |n: usize| n + n % 2;
-    let sr = sample_rate as usize;
-    Ok((even(320 * sr / 8000), even(160 * sr / 8000)))
-}
 
 /// Periodic Hann window of length `n`, like `torch.hann_window(n)`.
 pub(crate) fn hann_window(n: usize) -> Vec<f32> {
@@ -47,121 +35,137 @@ fn reflect_pad(signal: &[f32], pad: usize) -> Vec<f32> {
 /// Per-bin rows of per-frame values, `[freq][time]`.
 pub type Spectrogram = Vec<Vec<f32>>;
 
-/// Complex STFT matching `torch.stft(y, n_fft, hop_length, win_length, hann_window, center=True, pad_mode='reflect', normalized=False, return_complex=True)`.
-///
-/// Returns `(mag, phase)` each shaped `[F, T]` where `F = n_fft/2 + 1`.
-pub fn stft(
-    signal: &[f32],
-    n_fft: usize,
-    hop_size: usize,
-    win_size: usize,
-) -> Result<(Spectrogram, Spectrogram)> {
-    let pad = n_fft / 2;
-    let padded = reflect_pad(signal, pad);
-    let window = hann_window(win_size);
-    let freq_bins = n_fft / 2 + 1;
-    let num_frames = (padded.len() - n_fft) / hop_size + 1;
-
-    let mut planner = RealFftPlanner::<f32>::new();
-    let r2c = planner.plan_fft_forward(n_fft);
-    let mut input_buf = vec![0.0f32; n_fft];
-    let mut output_buf = r2c.make_output_vec();
-    let mut scratch = r2c.make_scratch_vec();
-
-    let mut mag = vec![vec![0.0f32; num_frames]; freq_bins];
-    let mut phase = vec![vec![0.0f32; num_frames]; freq_bins];
-
-    for t in 0..num_frames {
-        let start = t * hop_size;
-        input_buf.fill(0.0);
-        for i in 0..win_size.min(padded.len() - start) {
-            input_buf[i] = padded[start + i] * window[i];
-        }
-
-        r2c.process_with_scratch(&mut input_buf, &mut output_buf, &mut scratch)
-            .map_err(|e| eyre!("FFT failed: {e}"))?;
-
-        for k in 0..freq_bins {
-            let re = output_buf[k].re;
-            let im = output_buf[k].im;
-            mag[k][t] = (re * re + im * im).sqrt();
-            phase[k][t] = im.atan2(re);
-        }
-    }
-
-    Ok((mag, phase))
+/// Reusable FFT plans and window for analysis and overlap-add synthesis.
+pub(crate) struct Stft {
+    window: Vec<f32>,
+    forward: Arc<dyn RealToComplex<f32>>,
+    inverse: Arc<dyn ComplexToReal<f32>>,
 }
 
-/// Inverse STFT matching `torch.istft(complex, n_fft, hop_length, win_length, hann_window, center=True)`.
-///
-/// `mag` and `phase` are `[F, T]` where `F = n_fft/2 + 1`.
-pub fn istft(
-    mag: &[Vec<f32>],
-    phase: &[Vec<f32>],
-    n_fft: usize,
-    hop_size: usize,
-    win_size: usize,
-) -> Result<Vec<f32>> {
-    let freq_bins = n_fft / 2 + 1;
-    let num_frames = mag[0].len();
-    let window = hann_window(win_size);
-
-    let mut planner = RealFftPlanner::<f32>::new();
-    let c2r = planner.plan_fft_inverse(n_fft);
-    let mut spec_buf = c2r.make_input_vec();
-    let mut time_buf = vec![0.0f32; n_fft];
-    let mut scratch = c2r.make_scratch_vec();
-
-    // Output length includes center padding on both sides
-    let out_len = n_fft / 2 + (num_frames - 1) * hop_size + n_fft / 2;
-    let mut output = vec![0.0f32; out_len];
-    let mut window_sum = vec![0.0f32; out_len];
-
-    for t in 0..num_frames {
-        // Build complex spectrum
-        for k in 0..freq_bins {
-            let m = mag[k][t];
-            let p = phase[k][t];
-            spec_buf[k] = realfft::num_complex::Complex::new(m * p.cos(), m * p.sin());
+impl Stft {
+    pub(crate) fn new(n_fft: usize, win_size: usize) -> Self {
+        let mut planner = RealFftPlanner::<f32>::new();
+        Self {
+            window: hann_window(win_size),
+            forward: planner.plan_fft_forward(n_fft),
+            inverse: planner.plan_fft_inverse(n_fft),
         }
-        // DC and Nyquist bins must be real for realfft
-        spec_buf[0].im = 0.0;
-        if freq_bins > 1 {
-            spec_buf[freq_bins - 1].im = 0.0;
-        }
+    }
 
-        c2r.process_with_scratch(&mut spec_buf, &mut time_buf, &mut scratch)
-            .map_err(|e| eyre!("IFFT failed: {e}"))?;
+    /// Complex STFT matching `torch.stft(y, n_fft, hop_length, win_length, hann_window, center=True, pad_mode='reflect', normalized=False, return_complex=True)`.
+    ///
+    /// Returns `(mag, phase)` each shaped `[F, T]` where `F = n_fft/2 + 1`.
+    pub(crate) fn stft(
+        &self,
+        signal: &[f32],
+        hop_size: usize,
+    ) -> Result<(Spectrogram, Spectrogram)> {
+        let n_fft = self.forward.len();
+        let window = &self.window;
+        let win_size = window.len();
+        let pad = n_fft / 2;
+        let padded = reflect_pad(signal, pad);
+        let freq_bins = n_fft / 2 + 1;
+        let num_frames = (padded.len() - n_fft) / hop_size + 1;
 
-        let offset = t * hop_size;
-        // realfft returns unnormalized output, divide by n_fft
-        let norm = 1.0 / n_fft as f32;
-        for i in 0..win_size {
-            let pos = offset + i;
-            if pos < out_len {
-                output[pos] += time_buf[i] * norm * window[i];
-                window_sum[pos] += window[i] * window[i];
+        let r2c = &self.forward;
+        let mut input_buf = vec![0.0f32; n_fft];
+        let mut output_buf = r2c.make_output_vec();
+        let mut scratch = r2c.make_scratch_vec();
+
+        let mut mag = vec![vec![0.0f32; num_frames]; freq_bins];
+        let mut phase = vec![vec![0.0f32; num_frames]; freq_bins];
+
+        for t in 0..num_frames {
+            let start = t * hop_size;
+            input_buf.fill(0.0);
+            for i in 0..win_size.min(padded.len() - start) {
+                input_buf[i] = padded[start + i] * window[i];
+            }
+
+            r2c.process_with_scratch(&mut input_buf, &mut output_buf, &mut scratch)
+                .map_err(|e| anyhow!("FFT failed: {e}"))?;
+
+            for k in 0..freq_bins {
+                let re = output_buf[k].re;
+                let im = output_buf[k].im;
+                mag[k][t] = (re * re + im * im).sqrt();
+                phase[k][t] = im.atan2(re);
             }
         }
+
+        Ok((mag, phase))
     }
 
-    // Normalize by window sum (overlap-add)
-    let tiny = 1e-11;
-    for i in 0..out_len {
-        if window_sum[i] > tiny {
-            output[i] /= window_sum[i];
+    /// Inverse STFT matching `torch.istft(complex, n_fft, hop_length, win_length, hann_window, center=True)`.
+    ///
+    /// `mag` and `phase` are `[F, T]` where `F = n_fft/2 + 1`.
+    pub(crate) fn istft(
+        &self,
+        mag: &[Vec<f32>],
+        phase: &[Vec<f32>],
+        hop_size: usize,
+    ) -> Result<Vec<f32>> {
+        let n_fft = self.inverse.len();
+        let window = &self.window;
+        let win_size = window.len();
+        let freq_bins = n_fft / 2 + 1;
+        let num_frames = mag[0].len();
+        let c2r = &self.inverse;
+        let mut spec_buf = c2r.make_input_vec();
+        let mut time_buf = vec![0.0f32; n_fft];
+        let mut scratch = c2r.make_scratch_vec();
+
+        // Output length includes center padding on both sides
+        let out_len = n_fft / 2 + (num_frames - 1) * hop_size + n_fft / 2;
+        let mut output = vec![0.0f32; out_len];
+        let mut window_sum = vec![0.0f32; out_len];
+
+        for t in 0..num_frames {
+            // Build complex spectrum
+            for k in 0..freq_bins {
+                let m = mag[k][t];
+                let p = phase[k][t];
+                let (sin, cos) = p.sin_cos();
+                spec_buf[k] = realfft::num_complex::Complex::new(m * cos, m * sin);
+            }
+            // DC and Nyquist bins must be real for realfft
+            spec_buf[0].im = 0.0;
+            if freq_bins > 1 {
+                spec_buf[freq_bins - 1].im = 0.0;
+            }
+
+            c2r.process_with_scratch(&mut spec_buf, &mut time_buf, &mut scratch)
+                .map_err(|e| anyhow!("IFFT failed: {e}"))?;
+
+            let offset = t * hop_size;
+            // realfft returns unnormalized output, divide by n_fft
+            let norm = 1.0 / n_fft as f32;
+            for i in 0..win_size {
+                let pos = offset + i;
+                if pos < out_len {
+                    output[pos] += time_buf[i] * norm * window[i];
+                    window_sum[pos] += window[i] * window[i];
+                }
+            }
         }
+
+        // Normalize by window sum (overlap-add)
+        let tiny = 1e-11;
+        for i in 0..out_len {
+            if window_sum[i] > tiny {
+                output[i] /= window_sum[i];
+            }
+        }
+
+        // Remove center padding (n_fft/2 on each side)
+        let pad = n_fft / 2;
+        if out_len > 2 * pad {
+            output.copy_within(pad..out_len - pad, 0);
+            output.truncate(out_len - 2 * pad);
+        }
+        Ok(output)
     }
-
-    // Remove center padding (n_fft/2 on each side)
-    let pad = n_fft / 2;
-    let trimmed = if out_len > 2 * pad {
-        output[pad..out_len - pad].to_vec()
-    } else {
-        output
-    };
-
-    Ok(trimmed)
 }
 
 /// Load a WAV file as mono f32 samples at its native sample rate.
@@ -202,22 +206,6 @@ pub fn load_wav(path: &str) -> Result<(Vec<f32>, u32)> {
     Ok((samples, spec.sample_rate))
 }
 
-/// Write mono f32 samples to a WAV file.
-pub fn save_wav(path: &str, samples: &[f32], sample_rate: u32) -> Result<()> {
-    let spec = hound::WavSpec {
-        channels: 1,
-        sample_rate,
-        bits_per_sample: 32,
-        sample_format: hound::SampleFormat::Float,
-    };
-    let mut writer = hound::WavWriter::create(path, spec)?;
-    for &s in samples {
-        writer.write_sample(s)?;
-    }
-    writer.finalize()?;
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -237,8 +225,9 @@ mod tests {
         let hop = 40;
         let win = 320;
 
-        let (mag, phase) = stft(&signal, n_fft, hop, win).unwrap();
-        let reconstructed = istft(&mag, &phase, n_fft, hop, win).unwrap();
+        let plan = Stft::new(n_fft, win);
+        let (mag, phase) = plan.stft(&signal, hop).unwrap();
+        let reconstructed = plan.istft(&mag, &phase, hop).unwrap();
 
         // Compare overlapping region
         let len = signal.len().min(reconstructed.len());
