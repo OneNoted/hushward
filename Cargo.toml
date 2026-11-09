@@ -5,6 +5,7 @@ edition = "2024"
 description = "A local ward against noise, powered by NVIDIA NemotronLabs RE-USE"
 license = "MIT"
 readme = "README.md"
+repository = "https://github.com/OneNoted/hushward"
 keywords = ["audio", "noise-suppression", "pipewire", "speech", "linux"]
 categories = ["command-line-utilities", "multimedia::audio"]
 publish = false

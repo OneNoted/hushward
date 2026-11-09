@@ -13,9 +13,11 @@ The live service also needs `pw-cat`, `pactl`, `curl`, and systemd user services
 `pactl` comes from your distribution’s PulseAudio client tools; you do not need
 to replace PipeWire with PulseAudio.
 
-From this checkout:
+Clone the repository and run setup:
 
 ```sh
+git clone https://github.com/OneNoted/hushward.git
+cd hushward
 mise trust
 mise install
 mise run setup
