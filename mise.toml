@@ -1,0 +1,80 @@
+[env]
+RUSTFLAGS = "-C target-cpu=native"
+
+[tools]
+rust = { version = "nightly-2026-11-09", components = "clippy,rustfmt" }
+actionlint = "1.7.12"
+
+[tasks.default]
+description = "Show Hushward commands"
+run = "mise tasks"
+
+[tasks.build]
+description = "Build the release binary"
+run = "cargo build --release --locked"
+
+[tasks.fmt]
+description = "Format Rust and mise configuration"
+run = ["cargo fmt --all", "mise fmt"]
+
+[tasks.lint]
+description = "Check formatting, Rust and CI workflows"
+run = [
+  "cargo fmt --all --check",
+  "mise fmt --check",
+  "cargo clippy --release --locked --workspace --all-targets -- -D warnings",
+  "actionlint",
+]
+
+[tasks.test]
+description = "Run unit and command-line tests"
+run = "cargo test --release --locked --workspace"
+
+[tasks.ci]
+description = "Run all checks"
+run = ["mise run lint", "mise run test"]
+
+[tasks.setup]
+description = "Choose a microphone, fetch the model and install Hushward"
+depends = ["build"]
+run = "./target/release/hushward setup"
+
+[tasks.run]
+description = "Run a command from this checkout"
+depends = ["build"]
+run = "./target/release/hushward"
+
+[tasks.start]
+description = "Raise the ward"
+run = '"$HOME/.local/bin/hushward" start'
+
+[tasks.stop]
+description = "Dismiss the ward"
+run = '"$HOME/.local/bin/hushward" stop'
+
+[tasks.status]
+description = "Show the ward and microphone status"
+run = '"$HOME/.local/bin/hushward" status'
+
+[tasks.uninstall]
+description = "Remove the command and service, keeping model files and settings"
+run = '"$HOME/.local/bin/hushward" uninstall'
+
+[tasks.doctor]
+description = "Check audio tools, PipeWire and model files"
+depends = ["build"]
+run = "./target/release/hushward doctor"
+
+[tasks.check]
+description = "Check whether your live preset keeps up"
+depends = ["build"]
+run = "./target/release/hushward check"
+
+[tasks.enhance]
+description = "Clean a WAV recording"
+depends = ["build"]
+run = "./target/release/hushward clean"
+
+[tasks."test:gpu"]
+description = "Compare Vulkan inference against CPU (requires model and GPU)"
+run = "cargo test --release --locked --test inference -- --ignored"
